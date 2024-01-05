@@ -12,35 +12,38 @@ enum CameraState {
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// host of the MQTT server you are connecting to
     #[clap(long, default_value = "localhost")]
     mqtt_host: String,
+    /// port of the MQTT server you are connecting to
     #[clap(long, default_value = "1883")]
     mqtt_port: u16,
+    /// keepalive in seconds
     #[clap(long, default_value = "60")]
     mqtt_keepalive: u64,
     #[clap(long, default_value = "1000")]
     mqtt_pending_throttle: u64,
 
-    // debounce duration in milliseconds, tune this to what works on your system
+    /// debounce duration in milliseconds, tune this to what works on your system
     #[clap(long, default_value = "300")]
     debounce_duration: u64,
 
-    #[clap(long, default_value = "1")]
+    /// loop duration in milliseconds
+    #[clap(long, default_value = "10")]
     loop_duration: u64,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
     tracing_subscriber::fmt::init();
+
+    let args = Args::parse();
 
     let notify = inotify::Inotify::init()?;
 
-    // glob for all devices in /dev/video*
     let files = glob::glob("/dev/video*")?;
-
     for file in files {
+        tracing::info!("adding watcher for: {:?}", file);
         notify.watches().add(
             file?.to_str().unwrap(),
             inotify::WatchMask::OPEN | inotify::WatchMask::CLOSE,
@@ -56,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("connecting to mqtt");
     let (mut client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    tracing::info!("send discovery message");
     write_discovery(&mut client).await?;
 
     let mut last_state = CameraState::Off;
@@ -92,7 +94,6 @@ async fn main() -> anyhow::Result<()> {
                 // This is required because the camera will open and close multiple times when it is first plugged in or
                 // opened by a browser and we don't want to send multiple events for that.
                 if last_event_time.elapsed() >= debounce_duration && current_state != last_state {
-                    tracing::info!("camera state changed: {:?}", current_state);
                     send_event(&mut client, current_state.clone()).await?;
                     last_state = current_state;
                     last_event_time = std::time::Instant::now();
@@ -119,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[tracing::instrument(skip(client))]
 async fn send_event(client: &mut AsyncClient, state: CameraState) -> anyhow::Result<()> {
     let topic = "homeassistant/binary_sensor/officecamera/state".to_string();
     let payload = match state {
@@ -139,6 +141,8 @@ async fn send_event(client: &mut AsyncClient, state: CameraState) -> anyhow::Res
 }
 
 // implment mqtt sensor discovery for homeassistant for our binary sensor
+// https://www.home-assistant.io/docs/mqtt/discovery/
+#[tracing::instrument(skip(client))]
 async fn write_discovery(client: &mut AsyncClient) -> anyhow::Result<()> {
     let payload = serde_json::json!({
         "name": "OfficeCamera",
@@ -158,6 +162,7 @@ async fn write_discovery(client: &mut AsyncClient) -> anyhow::Result<()> {
     let topic = "homeassistant/binary_sensor/officecamera/config".to_string();
     let payload = serde_json::to_string(&payload)?;
 
+    tracing::info!("publishing MQTT discovery paylod");
     if let Err(e) = client
         .publish(&topic, QoS::AtLeastOnce, true, payload)
         .await
