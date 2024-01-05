@@ -1,8 +1,7 @@
-use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::Duration;
 
 use clap::Parser;
-
+use futures_util::StreamExt;
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -17,7 +16,16 @@ struct Args {
     mqtt_host: String,
     #[clap(long, default_value = "1883")]
     mqtt_port: u16,
-    #[clap(long, default_value = "5")]
+    #[clap(long, default_value = "60")]
+    mqtt_keepalive: u64,
+    #[clap(long, default_value = "1000")]
+    mqtt_pending_throttle: u64,
+
+    // debounce duration in milliseconds, tune this to what works on your system
+    #[clap(long, default_value = "300")]
+    debounce_duration: u64,
+
+    #[clap(long, default_value = "1")]
     loop_duration: u64,
 }
 
@@ -27,8 +35,23 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    let notify = inotify::Inotify::init()?;
+
+    // glob for all devices in /dev/video*
+    let files = glob::glob("/dev/video*")?;
+
+    for file in files {
+        notify.watches().add(
+            file?.to_str().unwrap(),
+            inotify::WatchMask::OPEN | inotify::WatchMask::CLOSE,
+        )?;
+    }
+
+    let mut buffer = [0u8; 4096];
+
     let mut mqttoptions = MqttOptions::new("camera-snitch", args.mqtt_host, args.mqtt_port);
-    mqttoptions.set_keep_alive(Duration::from_secs(30));
+    mqttoptions.set_keep_alive(Duration::from_secs(args.mqtt_keepalive));
+    mqttoptions.set_pending_throttle(Duration::from_micros(args.mqtt_pending_throttle));
 
     tracing::info!("connecting to mqtt");
     let (mut client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
@@ -38,38 +61,61 @@ async fn main() -> anyhow::Result<()> {
 
     let mut last_state = CameraState::Off;
 
-    // loop every X seconds to check if camera is on, publish the state mesage if it has changed
+    let debounce_duration = Duration::from_millis(args.debounce_duration);
+    let mut last_event_time = std::time::Instant::now() - debounce_duration;
+
+    let mut stream = notify.into_event_stream(&mut buffer)?;
+
     loop {
-        match check_camera_state() {
-            Ok(state) => {
-                if state != last_state {
-                    tracing::info!("camera state changed: {:?}", state);
-                    last_state = state.clone();
-                    send_event(&mut client, state).await?;
+        let mut current_state = last_state.clone();
+
+        tokio::select! {
+            Some(event) = stream.next() => {
+
+                if let Ok(event) = event {
+                    tracing::debug!("inotify event: {:?}", event);
+                    match event.mask {
+                        inotify::EventMask::OPEN => {
+                            tracing::info!("camera opened");
+                            current_state = CameraState::On;
+                        }
+                        inotify::EventMask::CLOSE_NOWRITE | inotify::EventMask::CLOSE_WRITE => {
+                            tracing::info!("camera closed");
+                            current_state = CameraState::Off;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // this is a simple debounce, we only send an event if the state has changed over the debounce window
+                //
+                // This is required because the camera will open and close multiple times when it is first plugged in or
+                // opened by a browser and we don't want to send multiple events for that.
+                if last_event_time.elapsed() >= debounce_duration && current_state != last_state {
+                    tracing::info!("camera state changed: {:?}", current_state);
+                    send_event(&mut client, current_state.clone()).await?;
+                    last_state = current_state;
+                    last_event_time = std::time::Instant::now();
                 }
             }
-            Err(e) => {
-                panic!("error checking camera state: {}", e)
+            Ok(notification) = eventloop.poll() => {
+                match notification {
+                    Event::Incoming(Incoming::Publish(p)) => {
+                        tracing::debug!("received message: {:?}", p);
+                    }
+                    Event::Incoming(i) => {
+                        tracing::debug!("received event: {:?}", i);
+                    }
+                    Event::Outgoing(o) => {
+                        tracing::debug!("sent event: {:?}", o);
+                    }
+                }
             }
-        };
-
-        let notification = eventloop.poll().await;
-        match notification {
-            Ok(Event::Incoming(Incoming::Publish(p))) => {
-                tracing::debug!("received message: {:?}", p);
-            }
-            Ok(Event::Incoming(i)) => {
-                tracing::debug!("received event: {:?}", i);
-            }
-            Ok(Event::Outgoing(o)) => {
-                tracing::debug!("sent event: {:?}", o);
-            }
-            Err(e) => {
-                tracing::error!("error receiving notification: {}", e);
+            else => {
+                tracing::debug!("looping");
+                tokio::time::sleep(Duration::from_millis(args.loop_duration)).await;
             }
         }
-
-        sleep(Duration::from_secs(args.loop_duration)).await;
     }
 }
 
@@ -120,21 +166,4 @@ async fn write_discovery(client: &mut AsyncClient) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-// TODO: is there a better more "event driven" and reliable way to do this?
-// inotify? dbus?
-fn check_camera_state() -> anyhow::Result<CameraState> {
-    let res = std::process::Command::new("bash")
-        .arg("-c")
-        .arg("lsof -t /dev/video*")
-        .output()?;
-
-    tracing::debug!("lsof output: {}", String::from_utf8(res.stdout.clone())?);
-
-    if res.stdout.is_empty() {
-        Ok(CameraState::Off)
-    } else {
-        Ok(CameraState::On)
-    }
 }

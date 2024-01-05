@@ -7,9 +7,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.79"
-clap = { version = "4.4.12", features = ["derive"] }
-
-# inotify = "0.10.2"
+clap = { version = "4.4.13", features = ["derive"] }
+futures-util = "0.3.30"
+glob = "0.3.1"
+inotify = "0.10.2"
 rumqttc = "0.23.0"
 serde_json = "1.0.110"
 tokio = { version = "1.35.1", features = ["full"] }
